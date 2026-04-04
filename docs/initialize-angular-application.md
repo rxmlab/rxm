@@ -1,190 +1,169 @@
-# Initialise Angular for cloud & Docker (build once, deploy many)
+# How to initialise your Angular application for real deployments
 
-**Author:** Ram Jawade
+**Author:** Ram Jawade  
+**Repository:** [rxmlab/rxm](https://github.com/rxmlab/rxm)
 
-**Repository:** [https://github.com/rxmlab/rxm](https://github.com/rxmlab/rxm)
+Modern Angular apps are often shipped as static files behind nginx, served from object storage, or baked into a container image. That raises a tension: **compile-time** `environment.ts` files are easy to use in development, but they fight the goal of **one build, many deployments**. This post walks through a pattern that fits cloud and Docker workflows, explains when you can skip an explicit API base URL, and shows how a small **environment service** can route HTTP calls to the right microservice in each stage (dev, QA, production).
 
 ---
 
-## How to use this doc
+## 1. Build once, deploy many times
 
-**~1 min read**
+### The problem
 
-There are two layers: a **full guide** that explains the problem, the pattern, and how it maps to Angular and ops, and a **quick reference** with tables and copy-paste examples. Start with either; the links below jump to the matching section.
+If you bake API URLs into the bundle at build time (for example by swapping `environment.prod.ts` per pipeline stage), you need **a separate artefact per environment**. That complicates promotion: the binary you tested in QA is not literally the same as what you run in production.
 
-**Jump to a whole part:** [Full guide](#full-guide) · [Quick reference](#quick-reference)
+### The approach: runtime configuration
 
-### Full guide (~5 min read)
+A common pattern is:
 
-Concepts and narrative — read this first if you want the “why” and full picture.
+1. **Build the Angular app once** with a neutral configuration (no stage-specific API hosts in the compiled code).
+2. At **startup**, load a small JSON file (for example `assets/env.json`) with URLs and service metadata for *this* deployment.
+3. In **Docker or Kubernetes**, you do not rebuild the image to change API endpoints—you **replace or mount** that JSON file (or generate it from environment variables in an entrypoint script).
 
-| Section | What you get |
+In this workspace, that load happens in an app initializer that fetches `assets/env.json` and registers the result with an injectable service (see `initializeEnvironment` and `EnvironmentService`). The app does not call backend APIs that depend on that config until the initializer has finished, which keeps race conditions under control.
+
+**Practical deployment tips**
+
+- **Docker**: copy a default `env.json` into the image, then override at run time (paths inside the image depend on how you serve the SPA—for example nginx):
+
+  ```bash
+  docker run -v ./env.prod.json:/usr/share/nginx/html/assets/env.json:ro
+  ```
+- **Kubernetes**: mount a `ConfigMap` (or Secret) as `assets/env.json`, or use an init container / entrypoint to write the file from env vars.
+- **CI/CD**: one pipeline produces one image or one static artefact; a later deploy step only swaps config, not the bundle.
+
+---
+
+## 2. When the UI and backend share the same environment, you may not need a full `baseUrl`
+
+Browsers resolve relative URLs against the **current origin** (`window.location.origin`). If the SPA and the API gateway (or BFF) are served from the **same host and scheme**—typical when a reverse proxy routes `/` to the SPA and `/api/...` to services—you can describe the API with a **relative** base path instead of `https://api.company.com`.
+
+Your `IMicroService` model reflects that idea: a `baseUrl` that does **not** start with `http` is treated as relative to the app’s origin, so calls stay on the same deployment without hard-coding the public hostname. When you truly call another host (another cluster, a legacy API, or a third-party service), use a full URL (`https://...`) in `baseUrl` for that microservice entry.
+
+That way:
+
+- **Same environment / same origin**: relative `baseUrl` (for example `""`, `/gateway`, or `/api`) keeps configuration minimal and portable.
+- **Cross-origin**: absolute `baseUrl` makes the intent explicit and works as long as CORS (and cookies, if used) are configured correctly.
+
+---
+
+## 3. How an environment service helps you talk to different microservices
+
+Backend systems are rarely a single monolith URL. You might have a **user** service, an **orders** service, and a **gateway**—each with its own path prefix or host.
+
+An environment service can hold a **registry** of named microservices, each with:
+
+- **`name`**: logical key your code uses (`users`, `orders`, …).
+- **`baseUrl`**: origin or prefix (relative or absolute, as above).
+- **`context` and `version`**: path segments such as `/users` and `/v1` so URLs stay consistent.
+- **`default`**: which service to use when code does not specify a name.
+
+HTTP wrappers (for example a thin `HttpService`) can then build the full base by combining those pieces and append the resource path for each request. Features that need a non-default backend pass the service name; everything else uses the default gateway or API.
+
+That keeps **feature code** free of hard-coded hosts and paths: it only cares about relative paths and, when needed, which microservice alias to use.
+
+---
+
+## 4. Managing dev, QA, staging, and production
+
+Runtime `env.json` (or the same shape under another filename) gives you a clear split of concerns:
+
+| Concern | Where it lives |
 |--------|----------------|
-| [Build once, deploy many](#fg-build-once) | Runtime config vs compile-time `environment.ts`, Docker/K8s/CI |
-| [Same origin / `baseUrl`](#fg-same-origin) | When UI and API share a host — relative URLs |
-| [Environment service & microservices](#fg-microservices) | Named backends, default service, URL composition |
-| [Dev, QA, production](#fg-stages) | One bundle, different `env.json` per stage |
-| [Angular wiring](#fg-angular) | Initializer + HTTP client bootstrap |
-| [Summary](#fg-summary) | Bullet recap |
+| Application code and bundle | One build artefact |
+| Per-stage URLs and service list | `env.json` (or mounted equivalent) per environment |
 
-### Quick reference (~2 min read)
+**Typical workflow**
 
-Scan or copy examples — tables, JSON, Docker, and the one-line “why.”
+1. Maintain **example** files in source control: `env.json.example`, or `config/env.dev.json`, `config/env.qa.json`, `config/env.prod.json`—without secrets; real secrets belong in the platform store, not in git.
+2. **Local dev**: serve an `env.json` that points to localhost or a shared dev cluster.
+3. **QA / staging / prod**: the **same** Docker image or static folder, with **different** `env.json` content supplied by the environment.
 
-| Section | What you get |
-|--------|----------------|
-| [TL;DR table](#qr-tldr) | Goals → actions at a glance |
-| [The pattern (3 steps)](#qr-pattern) | Build / boot / deploy |
-| [Example `env.json`](#qr-env-json) | Same-origin + external API |
-| [Example Angular wiring](#qr-angular) | `provideAppInitializer` snippet |
-| [Example deploy](#qr-deploy) | Docker, K8s, CI notes |
-| [Staging files](#qr-staging) | `env.dev.json` / `env.qa.json` / `env.prod.json` |
-| [Why not `environment.prod.ts`?](#qr-why-env) | One line comparison |
+You can generate that file from CI variables or from the orchestrator so operators never rebuild the frontend to change a backend URL.
 
 ---
 
-<a id="full-guide"></a>
+## 5. Putting it together in Angular
 
-## Full guide
+1. **`provideHttpClient()`** and an **`APP_INITIALIZER`** (or `provideAppInitializer`) that runs **before** the app is ready.
+2. The initializer **GET**s `assets/env.json`, parses it, and calls something like `environmentService.setMicroServices(...)`.
+3. Services that call APIs **inject** the environment service (and optionally a small HTTP facade) and use **named** or **default** microservice resolution for every outbound URL.
 
-**Estimated read time: ~5 minutes**
-
-<a id="fg-build-once"></a>
-
-### Build once, deploy many
-
-Compile-time `environment.ts` is fine locally, but it bakes API hosts into the bundle. That forces **a different build per stage** (dev, QA, prod), so the artefact you promote is not literally identical everywhere.
-
-**Approach:** build the app **once** with neutral config; at **startup**, `GET` a small JSON file (for example `assets/env.json`) with URLs and microservice metadata. In Docker or Kubernetes, **swap or mount** that file (or generate it in an entrypoint) — **no rebuild** to change endpoints.
-
-In this repo, `initializeEnvironment` loads `assets/env.json` and calls `EnvironmentService.setMicroServices(...)`. The initializer runs before the app is ready, so dependent API calls do not race ahead of config.
-
-**Ops:** Docker volume over `assets/env.json`; Kubernetes `ConfigMap` or init/entrypoint; CI builds once and deploy injects config only.
-
-<a id="fg-same-origin"></a>
-
-### Same origin / `baseUrl`
-
-If the SPA and API (or gateway/BFF) share **same scheme + host** — common with a reverse proxy (`/` → static app, `/api/...` → backends) — use a **relative** `baseUrl` (`""`, `/gateway`, `/api`). The browser resolves it against `window.location.origin`, so you do not repeat the public hostname.
-
-If the API lives on **another host**, use a full URL in `baseUrl` (`https://...`) and handle CORS (and cookies if applicable).
-
-This matches `IMicroService`: non-`http` `baseUrl` → same deployment; `http(s)` → explicit cross-origin target.
-
-<a id="fg-microservices"></a>
-
-### Environment service & microservices
-
-Backends are often split (users, orders, gateway). Register each as a **named** entry: `name`, `baseUrl`, `context`, `version`, optional `default`. The environment service resolves **default** when callers omit a name; HTTP helpers prepend the composed base to each path so feature code stays free of hard-coded hosts.
-
-<a id="fg-stages"></a>
-
-### Dev, QA, production
-
-**One bundle**, **different runtime config** per stage. Keep templates like `env.dev.json` / `env.qa.json` / `env.prod.json` in git **without** secrets; inject secrets via your platform. Generate or mount the final `assets/env.json` per environment.
-
-<a id="fg-angular"></a>
-
-### Angular wiring
-
-Provide `HttpClient`, then `provideAppInitializer(initializeEnvironment)` so config loads first. Services inject `EnvironmentService` (and optionally a thin `HttpService`) to build request URLs.
-
-<a id="fg-summary"></a>
-
-### Full guide summary
-
-- **Build once, deploy many:** runtime `env.json` (mount/replace per deploy), not per-stage builds.
-- **Same origin:** relative `baseUrl`; absolute URL when the API is elsewhere.
-- **Microservices:** named registry + default + composed `baseUrl` / `context` / `version`.
-- **Stages:** same artefact; vary only config.
+This matches how many teams run Angular in Kubernetes or behind a corporate gateway: **one image, many configs**, optional same-origin relative bases, and a single place to describe how the UI reaches each microservice in every environment.
 
 ---
 
-<a id="quick-reference"></a>
+## Example
 
-## Quick reference
+This workspace follows the pattern with a concrete `assets/env.json`, an app initializer, and a thin HTTP facade.
 
-**Estimated read time: ~2 minutes**
+### Runtime config (`src/assets/env.json`)
 
-<a id="qr-tldr"></a>
-
-### Quick reference — TL;DR
-
-| Goal | Do this |
-|------|--------|
-| One Docker image for dev / QA / prod | Load `assets/env.json` at **startup**, not at **build** |
-| UI + API same host | Use **relative** `baseUrl` (e.g. `/gateway`) — no hard-coded domain |
-| Many backends | One **registry** in JSON; **EnvironmentService** builds URLs; optional **default** service |
-
-<a id="qr-pattern"></a>
-
-### Quick reference — the pattern
-
-1. **Build once** — no per-stage API URLs in the bundle.  
-2. **On boot** — `APP_INITIALIZER` fetches `assets/env.json` and calls `setMicroServices(...)`.  
-3. **Per deploy** — swap or mount `env.json` only (same artefact everywhere).
-
-<a id="qr-env-json"></a>
-
-### Quick reference — example `env.json`
-
-Same-origin gateway + external API:
+The file is an **array** of microservice descriptors. One entry should set `"default": true` (or the first entry is used as the default).
 
 ```json
 [
   {
-    "name": "users",
     "baseUrl": "https://api.example.com",
     "context": "/users",
     "version": "/v1",
-    "default": true
+    "default": true,
+    "name": "users"
   },
   {
-    "name": "orders",
     "baseUrl": "/gateway",
     "context": "/orders",
-    "version": "/v1"
+    "version": "v1",
+    "name": "orders"
   }
 ]
 ```
 
-- **`baseUrl`** starts with `http` → full host. Otherwise → relative to `window.location.origin`.  
-- **`default: true`** → used when your HTTP helper does not pick a named service.
+- **`users`**: absolute `baseUrl` for a dedicated API host; marked default so unnamed calls go here.
+- **`orders`**: relative `baseUrl` (`/gateway`) for same-origin routing through a gateway; no `default`, so code must pass the service name when you want this backend.
 
-<a id="qr-angular"></a>
+### Bootstrap (`src/app/app.config.ts`)
 
-### Quick reference — example Angular wiring
+`provideHttpClient()` is registered together with `provideAppInitializer(initializeEnvironment)` so the initializer can fetch `assets/env.json` before the rest of the app runs:
 
 ```typescript
-// app.config.ts
-provideAppInitializer(initializeEnvironment),
-provideHttpClient(),
+import { ApplicationConfig, provideAppInitializer } from '@angular/core';
+import { provideHttpClient } from '@angular/common/http';
+import { initializeEnvironment } from '@rxm/core';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    // ...
+    provideAppInitializer(initializeEnvironment),
+    provideHttpClient(),
+  ],
+};
 ```
 
-Initializer loads JSON and registers services (see `libs/.../environment.initializer.ts` and `EnvironmentService` in this repo).
+### Initializer (`initializeEnvironment`)
 
-<a id="qr-deploy"></a>
+The initializer injects `HttpClient` and `EnvironmentService`, loads `assets/env.json`, and calls `environmentService.setMicroServices(json)` so the registry is ready before routed components load.
 
-### Quick reference — example deploy
+### Feature code
 
-**Docker** (mount config over the baked-in file; adjust path to your image):
+Inject `HttpService` and use **path-only** URLs for the default microservice; the service combines `baseUrl`, `context`, and `version` from the loaded config before issuing the request.
 
-```bash
-docker run -v ./env.qa.json:/usr/share/nginx/html/assets/env.json:ro my-app:1.0.0
+```typescript
+// Illustrative: resolves against the default microservice from env.json
+this.httpService.get<Profile>('/profile');
 ```
 
-**Kubernetes** — `ConfigMap` volume mounted at `assets/env.json`, or init/entrypoint that writes the file from env vars.
+To target a named microservice (for example `orders`), extend your HTTP layer to pass a service name into `EnvironmentService#getContext(serviceName)`—the same way you would for multiple backends.
 
-**CI** — one job builds the image; deploy jobs only inject the right `env.json` per environment.
+---
 
-<a id="qr-staging"></a>
+## Summary
 
-### Quick reference — staging files
+- **Build once, deploy many**: load API and microservice configuration at runtime (for example `assets/env.json`), and swap or mount that file per environment instead of rebuilding.
+- **UI and BE on the same origin**: prefer relative `baseUrl` values so you do not duplicate the public hostname; use absolute URLs when the API is on another host.
+- **Environment service**: register named microservices with `baseUrl`, `context`, and `version`, resolve a default, and centralise URL construction for your HTTP layer.
+- **dev / QA / prod**: keep one bundle; vary only the runtime config file (or generated config) per stage.
+- **Example**: this repo’s `assets/env.json`, `app.config.ts`, and `initializeEnvironment` show the pattern end to end (see **Example** above).
 
-Keep **`env.dev.json`**, **`env.qa.json`**, **`env.prod.json`** (or templates) **outside** secrets in git; inject real secrets via your platform. **Same bundle** + **different file** per stage.
-
-<a id="qr-why-env"></a>
-
-### Quick reference — why not `environment.prod.ts`?
-
-Compile-time env = **new build per stage**. Runtime `env.json` = **one build**, change URLs by config only — aligned with Docker/K8s promotion.
+If you adopt this pattern, your Angular initialisation story stays aligned with cloud-native deployment: the app starts, loads its map of backends, then serves users with the right endpoints everywhere you deploy the same build.
