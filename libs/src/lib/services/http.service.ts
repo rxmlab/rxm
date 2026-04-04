@@ -10,9 +10,35 @@ export class HttpService {
   private _http = inject(HttpClient);
   private _environment = inject(EnvironmentService);
 
-  get<T>(url: string): Observable<T> {
-    return this._http.get<T>(this._environment.getContext() + url);
+  private _url(url: string): string {
+    return this._environment.getContext() + url;
   }
 
-  post() {}
+  get<T>(url: string): Observable<T> {
+    return this._http.get<T>(this._url(url));
+  }
+
+  post<T>(url: string, body: unknown | null): Observable<T> {
+    return this._http.post<T>(this._url(url), body);
+  }
+
+  put<T>(url: string, body: unknown | null): Observable<T> {
+    return this._http.put<T>(this._url(url), body);
+  }
+
+  patch<T>(url: string, body: unknown | null): Observable<T> {
+    return this._http.patch<T>(this._url(url), body);
+  }
+
+  delete<T>(url: string): Observable<T> {
+    return this._http.delete<T>(this._url(url));
+  }
+
+  head<T>(url: string): Observable<T> {
+    return this._http.head<T>(this._url(url));
+  }
+
+  options<T>(url: string): Observable<T> {
+    return this._http.options<T>(this._url(url));
+  }
 }
